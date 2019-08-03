@@ -1,8 +1,8 @@
 package tpm2tools
 
 import (
+	"bytes"
 	"crypto"
-	"crypto/sha256"
 	"fmt"
 	"io"
 
@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-tpm/tpmutil"
 
 	"github.com/google/go-tpm-tools/proto"
+	"github.com/google/go-tpm-tools/server"
 )
 
 // Key wraps an active TPM2 key. Users of Key should be sure to call Close()
@@ -20,6 +21,7 @@ type Key struct {
 	pubArea tpm2.Public
 	pubKey  crypto.PublicKey
 	name    tpm2.Name
+	session tpmutil.Handle
 }
 
 // EndorsementKeyRSA generates and loads a key from DefaultEKTemplateRSA.
@@ -139,8 +141,35 @@ func (k *Key) finish() error {
 	if k.pubKey, err = k.pubArea.Key(); err != nil {
 		return err
 	}
-	k.name, err = k.pubArea.Name()
+	if k.name, err = k.pubArea.Name(); err != nil {
+		return err
+	}
+	if bytes.Equal(k.pubArea.AuthPolicy, defaultEKAuthPolicy()) {
+		// EK uses Policy Authorization Session
+		k.session, _, err = tpm2.StartAuthSession(
+			k.rw,
+			tpm2.HandleNull,  /*tpmKey*/
+			tpm2.HandleNull,  /*bindKey*/
+			make([]byte, 16), /*nonceCaller*/
+			nil,              /*secret*/
+			tpm2.SessionPolicy,
+			tpm2.AlgNull,
+			tpm2.AlgSHA256)
+	}
 	return err
+}
+
+// Reauthorize performs any actions that must be done before using the key.
+func (k *Key) Reauthorize() (tpm2.AuthCommand, error) {
+	nullAuth := tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}
+	if bytes.Equal(k.pubArea.AuthPolicy, defaultEKAuthPolicy()) {
+		_, err := tpm2.PolicySecret(k.rw, tpm2.HandleEndorsement, nullAuth, k.session, nil, nil, nil, 0)
+		if err != nil {
+			return tpm2.AuthCommand{}, fmt.Errorf("reauthorizing key: %v", err)
+		}
+		return tpm2.AuthCommand{Session: k.session, Attributes: tpm2.AttrContinueSession}, nil
+	}
+	return nullAuth, nil
 }
 
 // Handle allows this key to be used directly with other go-tpm commands.
@@ -163,12 +192,28 @@ func (k *Key) PublicKey() crypto.PublicKey {
 // do as most TPMs can only have a small number of key simultaneously loaded.
 func (k *Key) Close() {
 	tpm2.FlushContext(k.rw, k.handle)
+	if k.session != 0 {
+		tpm2.FlushContext(k.rw, k.session)
+	}
+}
+
+// ImportSecret decrypts a blob using TPM2_Import
+func (k *Key) ImportSecret(data *proto.ImportData) ([]byte, error) {
+	auth, err := k.Reauthorize()
+	if err != nil {
+		return nil, err
+	}
+	priv, err := tpm2.ImportUsingAuth(k.rw, k.handle, auth, data.Pub, data.Priv, data.OuterSeed, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Importing secret failed: %v", err)
+	}
+	return k.unsealHelper(data.Pub, priv, data.Pcrs)
 }
 
 // Seal seals the sensitive byte buffer to the provided PCRs under the owner
 // hierarchy using the SHA256 versions of the provided PCRs.
 // The Key k is used as the parent key.
-func (k *Key) Seal(pcrs []int, sensitive []byte) (*proto.SealedBytes, error) {
+func (k *Key) Seal(pcrs []int32, sensitive []byte) (*proto.SealedBytes, error) {
 	auth, err := getPCRSessionAuth(k.rw, pcrs)
 	if err != nil {
 		return nil, fmt.Errorf("could not get pcr session auth: %v", err)
@@ -178,9 +223,7 @@ func (k *Key) Seal(pcrs []int, sensitive []byte) (*proto.SealedBytes, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, pcr := range pcrs {
-		sb.Pcrs = append(sb.Pcrs, int32(pcr))
-	}
+	sb.Pcrs = pcrs
 	sb.Hash = proto.HashAlgo_SHA256
 	sb.Srk = proto.ObjectType(k.pubArea.Type)
 	return sb, nil
@@ -209,111 +252,56 @@ func (k *Key) Unseal(in *proto.SealedBytes) ([]byte, error) {
 	if in.Hash != proto.HashAlgo_SHA256 {
 		return nil, fmt.Errorf("Only SHA256 PCRs are currently supported")
 	}
-	var pcrs []int
-	for _, pcr := range in.Pcrs {
-		pcrs = append(pcrs, int(pcr))
-	}
-	session, err := createPCRSession(k.rw, pcrs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unseal: %v", err)
-	}
-	defer tpm2.FlushContext(k.rw, session)
+	return k.unsealHelper(in.Pub, in.Priv, in.Pcrs)
+}
 
-	sealed, _, err := tpm2.Load(
-		k.rw,
-		k.Handle(),
-		/*parentPassword=*/ "",
-		in.Pub,
-		in.Priv)
+func (k *Key) unsealHelper(pub, priv []byte, pcrs []int32) ([]byte, error) {
+	auth, err := k.Reauthorize()
+	if err != nil {
+		return nil, err
+	}
+	sealed, _, err := tpm2.LoadUsingAuth(k.rw, k.Handle(), auth, pub, priv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load sealed object: %v", err)
 	}
 	defer tpm2.FlushContext(k.rw, sealed)
 
-	return tpm2.UnsealWithSession(k.rw, session, sealed, "")
+	session, err := createPCRSession(k.rw, pcrs)
+	if err != nil {
+		return nil, fmt.Errorf("failed create PCR session: %v", err)
+	}
+	defer tpm2.FlushContext(k.rw, session)
+
+	secret, err := tpm2.UnsealWithSession(k.rw, session, sealed, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to unseal secret: %v", err)
+	}
+	return secret, nil
 }
 
 // Reseal unwraps a secret and rewraps it under the auth value that would be
 // produced by the PCR state in pcrs. Similar to seal and unseal, this acts on
 // the SHA256 PCRs and uses the owner hierarchy.
 // The Key k is used as the parent key.
-func (k *Key) Reseal(pcrs map[int][]byte, in *proto.SealedBytes) (*proto.SealedBytes, error) {
+func (k *Key) Reseal(pcrs map[int32][]byte, in *proto.SealedBytes) (*proto.SealedBytes, error) {
 	sensitive, err := k.Unseal(in)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unseal: %v", err)
 	}
 
-	auth, err := computePCRSessionAuth(pcrs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute pcr session auth: %v", err)
-	}
-
-	sb, err := sealHelper(k.rw, k.Handle(), auth, sensitive)
+	sb, err := sealHelper(k.rw, k.Handle(), server.ComputePCRSessionAuth(pcrs), sensitive)
 	if err != nil {
 		return nil, err
 	}
 	for pcr := range pcrs {
-		sb.Pcrs = append(sb.Pcrs, int32(pcr))
+		sb.Pcrs = append(sb.Pcrs, pcr)
 	}
 	sb.Hash = in.Hash
 	sb.Srk = in.Srk
 	return sb, nil
 }
 
-type tpmsPCRSelection struct {
-	Hash tpm2.Algorithm
-	Size byte
-	PCRs tpmutil.RawBytes
-}
-
-type sessionSummary struct {
-	OldDigest      tpmutil.RawBytes
-	CmdIDPolicyPCR uint32
-	NumPcrSels     uint32
-	Sel            tpmsPCRSelection
-	PcrDigest      tpmutil.RawBytes
-}
-
-func computePCRSessionAuth(pcrs map[int][]byte) ([]byte, error) {
-	var pcrBits [3]byte
-	for pcr := range pcrs {
-		byteNum := pcr / 8
-		bytePos := byte(1 << byte(pcr%8))
-		pcrBits[byteNum] |= bytePos
-	}
-	pcrDigest := digestPCRList(pcrs)
-
-	summary := sessionSummary{
-		OldDigest:      make([]byte, sha256.Size),
-		CmdIDPolicyPCR: uint32(tpm2.CmdPolicyPCR),
-		NumPcrSels:     1,
-		Sel: tpmsPCRSelection{
-			Hash: tpm2.AlgSHA256,
-			Size: 3,
-			PCRs: pcrBits[:],
-		},
-		PcrDigest: pcrDigest,
-	}
-	b, err := tpmutil.Pack(summary)
-	if err != nil {
-		return nil, fmt.Errorf("failed to pack for hashing: %v ", err)
-	}
-
-	digest := sha256.Sum256(b)
-	return digest[:], nil
-}
-
-func digestPCRList(pcrs map[int][]byte) []byte {
-	hash := crypto.SHA256.New()
-	for i := 0; i < 24; i++ {
-		if pcrValue, exists := pcrs[i]; exists {
-			hash.Write(pcrValue)
-		}
-	}
-	return hash.Sum(nil)
-}
-
-func getPCRSessionAuth(rw io.ReadWriter, pcrs []int) ([]byte, error) {
+func getPCRSessionAuth(rw io.ReadWriter, pcrs []int32) ([]byte, error) {
 	handle, err := createPCRSession(rw, pcrs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get digest: %v", err)
@@ -328,7 +316,7 @@ func getPCRSessionAuth(rw io.ReadWriter, pcrs []int) ([]byte, error) {
 	return digest, nil
 }
 
-func createPCRSession(rw io.ReadWriter, pcrs []int) (tpmutil.Handle, error) {
+func createPCRSession(rw io.ReadWriter, pcrs []int32) (tpmutil.Handle, error) {
 	nonceIn := make([]byte, 16)
 	/* This session assumes the bus is trusted.  */
 	handle, _, err := tpm2.StartAuthSession(
@@ -344,9 +332,9 @@ func createPCRSession(rw io.ReadWriter, pcrs []int) (tpmutil.Handle, error) {
 		return tpm2.HandleNull, fmt.Errorf("failed to start auth session: %v", err)
 	}
 
-	sel := tpm2.PCRSelection{
-		Hash: tpm2.AlgSHA256,
-		PCRs: pcrs,
+	sel := tpm2.PCRSelection{Hash: tpm2.AlgSHA256}
+	for _, pcr := range pcrs {
+		sel.PCRs = append(sel.PCRs, int(pcr))
 	}
 	if err = tpm2.PolicyPCR(rw, handle, nil, sel); err != nil {
 		return tpm2.HandleNull, fmt.Errorf("auth step PolicyPCR failed: %v", err)

@@ -63,6 +63,7 @@ func TestCachedRSAKeys(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer srk.Close()
 			pub := srk.PublicKey()
 			if tpm2.FlushContext(rwc, srk.Handle()) == nil {
 				t.Error("Trying to flush persistent keys should fail.")
@@ -73,6 +74,7 @@ func TestCachedRSAKeys(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer srk.Close()
 			if !reflect.DeepEqual(srk.PublicKey(), pub) {
 				t.Errorf("Expected pub key: %v got: %v", pub, srk.PublicKey())
 			}
@@ -85,6 +87,7 @@ func TestCachedRSAKeys(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer srk.Close()
 			if !reflect.DeepEqual(srk.PublicKey(), pub) {
 				t.Errorf("Expected pub key: %v got: %v", pub, srk.PublicKey())
 			}

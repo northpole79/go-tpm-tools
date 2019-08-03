@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-tpm/tpmutil"
 
 	"github.com/google/go-tpm-tools/internal"
+	"github.com/google/go-tpm-tools/server"
 )
 
 func TestSeal(t *testing.T) {
@@ -32,7 +33,7 @@ func TestSeal(t *testing.T) {
 			defer srk.Close()
 
 			secret := []byte("test")
-			pcrList := []int{7, 23}
+			pcrList := []int32{7, 23}
 			pcrToExtend := tpmutil.Handle(23)
 
 			sealed, err := srk.Seal(pcrList, secret)
@@ -65,12 +66,12 @@ func TestComputeSessionAuth(t *testing.T) {
 	rwc := internal.GetTPM(t)
 	defer CheckedClose(t, rwc)
 
-	pcrList := []int{1, 7}
+	pcrList := []int32{1, 7}
 
-	pcrs := map[int][]byte{}
+	pcrs := map[int32][]byte{}
 
 	for _, pcrNum := range pcrList {
-		pcrVal, err := tpm2.ReadPCR(rwc, pcrNum, tpm2.AlgSHA256)
+		pcrVal, err := tpm2.ReadPCR(rwc, int(pcrNum), tpm2.AlgSHA256)
 		if err != nil {
 			t.Fatalf("failed to read pcr: %v", err)
 		}
@@ -83,11 +84,7 @@ func TestComputeSessionAuth(t *testing.T) {
 		t.Fatalf("failed to get session auth: %v", err)
 	}
 
-	computeAuth, err := computePCRSessionAuth(pcrs)
-	if err != nil {
-		t.Fatalf("failed to compute session auth: %v", err)
-	}
-
+	computeAuth := server.ComputePCRSessionAuth(pcrs)
 	if !bytes.Equal(computeAuth, getAuth) {
 		t.Fatalf("computed auth (%v) not equal to session auth(%v)", computeAuth, getAuth)
 	}
@@ -105,10 +102,10 @@ func TestSelfReseal(t *testing.T) {
 
 	secret := []byte("test")
 
-	pcrList := []int{0, 4, 7}
-	pcrs := map[int][]byte{}
+	pcrList := []int32{0, 4, 7}
+	pcrs := map[int32][]byte{}
 	for _, pcrNum := range pcrList {
-		pcrVal, err := tpm2.ReadPCR(rwc, pcrNum, tpm2.AlgSHA256)
+		pcrVal, err := tpm2.ReadPCR(rwc, int(pcrNum), tpm2.AlgSHA256)
 		if err != nil {
 			t.Fatalf("failed to read pcr: %v", err)
 		}
@@ -198,11 +195,11 @@ func TestReseal(t *testing.T) {
 
 	secret := []byte("test")
 
-	pcrToChange := 23
-	pcrList := []int{7, 23}
-	pcrs := map[int][]byte{}
+	pcrToChange := int32(23)
+	pcrList := []int32{7, 23}
+	pcrs := map[int32][]byte{}
 	for _, pcrNum := range pcrList {
-		pcrVal, err := tpm2.ReadPCR(rwc, pcrNum, tpm2.AlgSHA256)
+		pcrVal, err := tpm2.ReadPCR(rwc, int(pcrNum), tpm2.AlgSHA256)
 		if err != nil {
 			t.Fatalf("failed to read pcr: %v", err)
 		}
